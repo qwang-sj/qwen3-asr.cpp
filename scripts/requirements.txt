@@ -1,0 +1,6 @@
+# Requirements for Qwen3-ASR GGUF converter
+numpy>=1.24.0
+torch>=2.0.0
+safetensors>=0.4.0
+transformers>=4.40.0
+tqdm>=4.65.0
