@@ -747,37 +747,120 @@ bool TextDecoder::load_vocab(struct gguf_context * ctx) {
     return true;
 }
 
+// GPT-2 byte-level BPE: reverse mapping from Unicode codepoints back to raw bytes.
+// See HuggingFace tokenizers bytes_to_unicode() — printable bytes map to themselves,
+// non-printable bytes map to codepoints 256+n.
+static std::vector<int> build_unicode_to_byte_table() {
+    std::vector<int> byte_to_cp(256, 0);
+    std::vector<bool> assigned(256, false);
+
+    auto mark = [&](int lo, int hi) {
+        for (int b = lo; b <= hi; ++b) {
+            byte_to_cp[b] = b;
+            assigned[b] = true;
+        }
+    };
+    mark(0x21, 0x7E);
+    mark(0xA1, 0xAC);
+    mark(0xAE, 0xFF);
+
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        if (!assigned[b]) {
+            byte_to_cp[b] = 256 + n;
+            ++n;
+        }
+    }
+
+    std::vector<int> cp_to_byte(512, -1);
+    for (int b = 0; b < 256; ++b) {
+        cp_to_byte[byte_to_cp[b]] = b;
+    }
+    return cp_to_byte;
+}
+
 std::string TextDecoder::decode_token(int32_t token_id) const {
     if (token_id < 0 || token_id >= (int32_t)vocab_.size()) {
         return "";
     }
-    
+
     std::string token = vocab_[token_id];
-    
-    if (token.size() >= 3 && token[0] == '<' && token[1] == '|' && 
+
+    // Skip special tokens like <|...|> and [PAD...]
+    if (token.size() >= 3 && token[0] == '<' && token[1] == '|' &&
         token[token.size()-1] == '>' && token[token.size()-2] == '|') {
         return "";
     }
-    
     if (token.size() >= 5 && token.substr(0, 4) == "[PAD") {
         return "";
     }
-    
-    std::string result;
-    result.reserve(token.size());
-    
-    for (size_t i = 0; i < token.size(); ++i) {
-        unsigned char c = token[i];
-        
-        if (c == 0xC4 && i + 1 < token.size() && (unsigned char)token[i+1] == 0xA0) {
-            result += ' ';
-            ++i;
+
+    // Byte-level BPE decode: each Unicode codepoint in the token string maps to a byte
+    // via the GPT-2 bytes_to_unicode table.
+    static const std::vector<int> cp_to_byte = build_unicode_to_byte_table();
+
+    std::string bytes;
+    bytes.reserve(token.size());
+
+    size_t i = 0;
+    while (i < token.size()) {
+        // Decode one UTF-8 codepoint from the token string
+        uint32_t cp = 0;
+        unsigned char c = static_cast<unsigned char>(token[i]);
+        size_t len = 0;
+
+        if (c < 0x80) {
+            cp = c; len = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            cp = c & 0x1F; len = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            cp = c & 0x0F; len = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            cp = c & 0x07; len = 4;
         } else {
-            result += token[i];
+            // Invalid UTF-8 start byte, pass through
+            bytes += static_cast<char>(c);
+            ++i;
+            continue;
+        }
+
+        if (i + len > token.size()) {
+            // Truncated sequence, pass through remaining bytes
+            while (i < token.size()) {
+                bytes += token[i++];
+            }
+            break;
+        }
+
+        for (size_t j = 1; j < len; ++j) {
+            cp = (cp << 6) | (static_cast<unsigned char>(token[i + j]) & 0x3F);
+        }
+        i += len;
+
+        // Look up the byte value for this codepoint
+        if (cp < cp_to_byte.size() && cp_to_byte[cp] >= 0) {
+            bytes += static_cast<char>(cp_to_byte[cp]);
+        } else {
+            // Codepoint not in BPE table — encode back as UTF-8 (shouldn't happen for valid vocab)
+            if (cp < 0x80) {
+                bytes += static_cast<char>(cp);
+            } else if (cp < 0x800) {
+                bytes += static_cast<char>(0xC0 | (cp >> 6));
+                bytes += static_cast<char>(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                bytes += static_cast<char>(0xE0 | (cp >> 12));
+                bytes += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                bytes += static_cast<char>(0x80 | (cp & 0x3F));
+            } else {
+                bytes += static_cast<char>(0xF0 | (cp >> 18));
+                bytes += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                bytes += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                bytes += static_cast<char>(0x80 | (cp & 0x3F));
+            }
         }
     }
-    
-    return result;
+
+    return bytes;
 }
 
 std::string TextDecoder::decode_tokens(const std::vector<int32_t> & tokens) const {

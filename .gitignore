@@ -4,6 +4,7 @@ cmake-build-*/
 
 # Models (too large for git)
 models/*.gguf
+Qwen3-ASR-0.6B/
 
 # Test reference data (generated)
 tests/reference/*.npy
