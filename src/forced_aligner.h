@@ -7,6 +7,7 @@
 #include <string>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace qwen3_asr {
@@ -163,6 +164,9 @@ struct forced_aligner_model {
     std::unordered_map<std::string, int> bpe_ranks;
     // Forward mapping: vocab token string -> token ID
     std::unordered_map<std::string, int32_t> token_to_id;
+    
+    // Korean dictionary for LTokenizer-style word splitting
+    std::unordered_set<std::string> ko_dict;
 };
 
 // KV cache for decoder
@@ -200,16 +204,11 @@ public:
     // Load model from GGUF file
     bool load_model(const std::string & model_path);
     
-    // Align text to audio
-    // audio_path: Path to WAV file (16kHz mono)
-    // text: Reference transcript text
-    alignment_result align(const std::string & audio_path, const std::string & text);
+    alignment_result align(const std::string & audio_path, const std::string & text,
+                           const std::string & language = "");
     
-    // Align text to audio samples
-    // samples: Audio samples normalized to [-1, 1]
-    // n_samples: Number of samples
-    // text: Reference transcript text
-    alignment_result align(const float * samples, int n_samples, const std::string & text);
+    alignment_result align(const float * samples, int n_samples, const std::string & text,
+                           const std::string & language = "");
     
     // Get error message
     const std::string & get_error() const { return error_msg_; }
@@ -220,9 +219,11 @@ public:
     // Get hyperparameters
     const forced_aligner_hparams & get_hparams() const { return model_.hparams; }
     
-    // Tokenize text and insert timestamp tokens
     std::vector<int32_t> tokenize_with_timestamps(const std::string & text,
-                                                   std::vector<std::string> & words);
+                                                   std::vector<std::string> & words,
+                                                   const std::string & language = "");
+    
+    bool load_korean_dict(const std::string & dict_path);
     
 private:
     // Load model components
@@ -283,10 +284,11 @@ private:
 // Free model resources
 void free_forced_aligner_model(forced_aligner_model & model);
 
-// Simple tokenizer for ForcedAligner
-// Splits text into words and encodes each word
 std::vector<int32_t> simple_tokenize(const std::string & text,
                                       const std::vector<std::string> & vocab,
                                       std::vector<std::string> & words);
+
+std::vector<std::string> tokenize_korean(const std::string & text,
+                                          const std::unordered_set<std::string> & ko_dict);
 
 } // namespace qwen3_asr

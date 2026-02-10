@@ -995,8 +995,7 @@ struct ggml_cgraph * ForcedAligner::build_decoder_graph(
     
     const float KQscale = 1.0f / sqrtf(float(head_dim));
     
-    // Causal attention mask: lower-triangular (0 = attend, -inf = block)
-    struct ggml_tensor * causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
+    struct ggml_tensor * causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_tokens, n_tokens);
     ggml_set_name(causal_mask, "causal_mask");
     ggml_set_input(causal_mask);
     
@@ -1039,18 +1038,13 @@ struct ggml_cgraph * ForcedAligner::build_decoder_graph(
                              head_dim, GGML_ROPE_TYPE_NEOX, 0,
                              rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         
-        struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
-        struct ggml_tensor * K = ggml_permute(ctx0, Kcur, 0, 2, 1, 3);
-        struct ggml_tensor * V = ggml_permute(ctx0, Vcur, 0, 2, 1, 3);
+        struct ggml_tensor * Qfa = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+        struct ggml_tensor * Kfa = ggml_permute(ctx0, Kcur, 0, 2, 1, 3);
+        struct ggml_tensor * Vfa = ggml_cast(ctx0, ggml_permute(ctx0, Vcur, 0, 2, 1, 3), GGML_TYPE_F16);
         
-        struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-        KQ = ggml_soft_max_ext(ctx0, KQ, causal_mask, KQscale, 0.0f);
-        
-        V = ggml_cont(ctx0, ggml_transpose(ctx0, V));
-        
-        struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
-        KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-        cur = ggml_cont_2d(ctx0, KQV, n_head * head_dim, n_tokens);
+        cur = ggml_flash_attn_ext(ctx0, Qfa, Kfa, Vfa, causal_mask, KQscale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        cur = ggml_reshape_2d(ctx0, cur, n_head * head_dim, n_tokens);
         
         cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
         cur = ggml_add(ctx0, cur, inpL);
@@ -1133,13 +1127,15 @@ bool ForcedAligner::forward_decoder(
     
     struct ggml_tensor * mask_t = ggml_graph_get_tensor(gf, "causal_mask");
     if (mask_t) {
-        std::vector<float> mask_data((size_t)n_tokens * n_tokens);
+        std::vector<ggml_fp16_t> mask_data((size_t)n_tokens * n_tokens);
+        const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neginf_f16 = ggml_fp32_to_fp16(-INFINITY);
         for (int q = 0; q < n_tokens; ++q) {
             for (int k = 0; k < n_tokens; ++k) {
-                mask_data[k + q * n_tokens] = (k <= q) ? 0.0f : -INFINITY;
+                mask_data[k + q * n_tokens] = (k <= q) ? zero_f16 : neginf_f16;
             }
         }
-        ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(float));
+        ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
     }
     
     if (audio_embd && n_audio > 0) {
@@ -1456,15 +1452,128 @@ static std::vector<std::string> bpe_encode_word(
     return symbols;
 }
 
+static size_t utf8_char_len(unsigned char c) {
+    if ((c & 0x80) == 0) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static size_t utf8_strlen(const std::string & s) {
+    size_t count = 0;
+    size_t i = 0;
+    while (i < s.size()) {
+        i += utf8_char_len(static_cast<unsigned char>(s[i]));
+        ++count;
+    }
+    return count;
+}
+
+static std::string utf8_substr(const std::string & s, size_t char_start, size_t char_count) {
+    size_t byte_start = 0;
+    for (size_t c = 0; c < char_start && byte_start < s.size(); ++c) {
+        byte_start += utf8_char_len(static_cast<unsigned char>(s[byte_start]));
+    }
+    size_t byte_end = byte_start;
+    for (size_t c = 0; c < char_count && byte_end < s.size(); ++c) {
+        byte_end += utf8_char_len(static_cast<unsigned char>(s[byte_end]));
+    }
+    return s.substr(byte_start, byte_end - byte_start);
+}
+
+std::vector<std::string> tokenize_korean(const std::string & text,
+                                          const std::unordered_set<std::string> & ko_dict) {
+    const float default_score = 0.0f;
+
+    std::vector<std::string> whitespace_words;
+    {
+        size_t i = 0;
+        while (i < text.size()) {
+            while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
+                                        text[i] == '\n' || text[i] == '\r')) ++i;
+            if (i >= text.size()) break;
+            size_t start = i;
+            while (i < text.size() && text[i] != ' ' && text[i] != '\t' &&
+                   text[i] != '\n' && text[i] != '\r') ++i;
+            whitespace_words.push_back(text.substr(start, i - start));
+        }
+    }
+
+    std::vector<std::string> result;
+
+    for (const auto & word : whitespace_words) {
+        size_t length = utf8_strlen(word);
+        if (length <= 2) {
+            result.push_back(word);
+            continue;
+        }
+
+        float best_score = -1e9f;
+        size_t best_left_len = 0;
+        std::string best_left;
+        std::string best_right;
+
+        for (size_t e = 2; e <= length; ++e) {
+            std::string left = utf8_substr(word, 0, e);
+            std::string right = utf8_substr(word, e, length - e);
+
+            float score = default_score;
+            if (ko_dict.count(left)) {
+                score = 1.0f;
+            }
+
+            if (score > best_score || (score == best_score && e > best_left_len)) {
+                best_score = score;
+                best_left_len = e;
+                best_left = left;
+                best_right = right;
+            }
+        }
+
+        result.push_back(best_left);
+        if (!best_right.empty()) {
+            result.push_back(best_right);
+        }
+    }
+
+    return result;
+}
+
+bool ForcedAligner::load_korean_dict(const std::string & dict_path) {
+    std::ifstream f(dict_path);
+    if (!f.is_open()) {
+        return false;
+    }
+
+    model_.ko_dict.clear();
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        size_t pos = line.find(' ');
+        std::string word = (pos != std::string::npos) ? line.substr(0, pos) : line;
+        if (!word.empty()) {
+            model_.ko_dict.insert(word);
+        }
+    }
+
+    fprintf(stderr, "Korean dictionary loaded: %zu words\n", model_.ko_dict.size());
+    return true;
+}
+
 std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
     const std::string & text,
-    std::vector<std::string> & words) {
+    std::vector<std::string> & words,
+    const std::string & language) {
 
     words.clear();
     std::vector<int32_t> tokens;
 
     std::vector<std::string> raw_words;
-    {
+
+    if (language == "korean" && !model_.ko_dict.empty()) {
+        raw_words = tokenize_korean(text, model_.ko_dict);
+    } else {
         size_t i = 0;
         while (i < text.size()) {
             while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
@@ -1477,8 +1586,6 @@ std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
         }
     }
 
-    // HF format: word1<ts><ts>word2<ts><ts>word3<ts><ts>
-    // 2 timestamps per word: start_time at position 2i, end_time at 2i+1
     for (size_t w = 0; w < raw_words.size(); ++w) {
         words.push_back(raw_words[w]);
 
@@ -1501,7 +1608,8 @@ std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
     return tokens;
 }
 
-alignment_result ForcedAligner::align(const std::string & audio_path, const std::string & text) {
+alignment_result ForcedAligner::align(const std::string & audio_path, const std::string & text,
+                                       const std::string & language) {
     alignment_result result;
     
     if (!model_loaded_) {
@@ -1522,10 +1630,11 @@ alignment_result ForcedAligner::align(const std::string & audio_path, const std:
         return result;
     }
     
-    return align(samples.data(), samples.size(), text);
+    return align(samples.data(), samples.size(), text, language);
 }
 
-alignment_result ForcedAligner::align(const float * samples, int n_samples, const std::string & text) {
+alignment_result ForcedAligner::align(const float * samples, int n_samples, const std::string & text,
+                                       const std::string & language) {
     alignment_result result;
     int64_t t_total_start = get_time_ms();
     
@@ -1561,7 +1670,7 @@ alignment_result ForcedAligner::align(const float * samples, int n_samples, cons
     int32_t n_audio_pads = get_feat_extract_output_lengths(mel.n_len);
     
     std::vector<std::string> words;
-    std::vector<int32_t> text_tokens = tokenize_with_timestamps(text, words);
+    std::vector<int32_t> text_tokens = tokenize_with_timestamps(text, words, language);
     
     std::vector<int32_t> input_tokens = build_input_tokens(text_tokens, n_audio_pads);
     
@@ -1628,6 +1737,7 @@ void free_forced_aligner_model(forced_aligner_model & model) {
     model.encoder_layers.clear();
     model.decoder_layers.clear();
     model.vocab.clear();
+    model.ko_dict.clear();
 }
 
 std::vector<int32_t> simple_tokenize(const std::string & text,

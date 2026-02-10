@@ -460,6 +460,12 @@ struct ggml_cgraph * TextDecoder::build_graph(
     
     const float KQscale = 1.0f / sqrtf(float(head_dim));
     
+    // Flash attention causal mask: [n_kv, n_tokens], F16
+    int n_kv = n_past + n_tokens;
+    struct ggml_tensor * fa_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, n_tokens);
+    ggml_set_name(fa_mask, "fa_mask");
+    ggml_set_input(fa_mask);
+    
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model_.layers[il];
         
@@ -514,8 +520,6 @@ struct ggml_cgraph * TextDecoder::build_graph(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k_cache_view));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v_cache_view));
         
-        int n_kv = n_past + n_tokens;
-        
         struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
             head_dim, n_kv_head, n_kv,
             k_cache->nb[1], k_cache->nb[2], 0);
@@ -524,20 +528,14 @@ struct ggml_cgraph * TextDecoder::build_graph(
             head_dim, n_kv_head, n_kv,
             v_cache->nb[1], v_cache->nb[2], 0);
         
-        struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+        // flash_attn_ext expects: Q[head_dim, n_tokens, n_head], K[head_dim, n_kv, n_kv_head], V[head_dim, n_kv, n_kv_head]
+        struct ggml_tensor * Qfa = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
         K = ggml_permute(ctx0, K, 0, 2, 1, 3);
         V = ggml_permute(ctx0, V, 0, 2, 1, 3);
         
-        struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-        KQ = ggml_scale(ctx0, KQ, KQscale);
-        KQ = ggml_diag_mask_inf(ctx0, KQ, n_past);
-        KQ = ggml_soft_max(ctx0, KQ);
-        
-        V = ggml_cont(ctx0, ggml_transpose(ctx0, V));
-        
-        struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
-        KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-        cur = ggml_cont_2d(ctx0, KQV, n_head * head_dim, n_tokens);
+        cur = ggml_flash_attn_ext(ctx0, Qfa, K, V, fa_mask, KQscale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        cur = ggml_reshape_2d(ctx0, cur, n_head * head_dim, n_tokens);
         
         cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
         cur = ggml_add(ctx0, cur, inpL);
@@ -633,6 +631,20 @@ bool TextDecoder::forward_with_audio(
         ggml_backend_tensor_set(inp_pos, positions.data(), 0, n_tokens * sizeof(int32_t));
     }
     
+    struct ggml_tensor * fa_mask_t = ggml_graph_get_tensor(gf, "fa_mask");
+    if (fa_mask_t) {
+        int n_kv = n_past + n_tokens;
+        std::vector<ggml_fp16_t> mask_data((size_t)n_kv * n_tokens);
+        const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neginf_f16 = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < n_tokens; ++q) {
+            for (int k = 0; k < n_kv; ++k) {
+                mask_data[k + q * n_kv] = (k <= n_past + q) ? zero_f16 : neginf_f16;
+            }
+        }
+        ggml_backend_tensor_set(fa_mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+    }
+    
     if (audio_embd && n_audio > 0) {
         struct ggml_tensor * inp_audio = ggml_graph_get_tensor(gf, "inp_audio");
         if (inp_audio) {
@@ -702,6 +714,20 @@ bool TextDecoder::forward_debug(const int32_t * tokens, int32_t n_tokens, int32_
             positions[i] = n_past + i;
         }
         ggml_backend_tensor_set(inp_pos, positions.data(), 0, n_tokens * sizeof(int32_t));
+    }
+    
+    struct ggml_tensor * fa_mask_t = ggml_graph_get_tensor(gf, "fa_mask");
+    if (fa_mask_t) {
+        int n_kv = n_past + n_tokens;
+        std::vector<ggml_fp16_t> mask_data((size_t)n_kv * n_tokens);
+        const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neginf_f16 = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < n_tokens; ++q) {
+            for (int k = 0; k < n_kv; ++k) {
+                mask_data[k + q * n_kv] = (k <= n_past + q) ? zero_f16 : neginf_f16;
+            }
+        }
+        ggml_backend_tensor_set(fa_mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
     }
     
     if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
