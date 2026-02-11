@@ -116,7 +116,7 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
         fprintf(stderr, "Audio features: [%d, %d]\n", n_audio_frames, text_hparams.hidden_size);
     }
     
-    std::vector<int32_t> input_tokens = build_input_tokens(n_audio_frames, params.language);
+    std::vector<int32_t> input_tokens = build_input_tokens(n_audio_frames, params.language, params.system_prompt);
     
     if (params.print_progress) {
         fprintf(stderr, "Input tokens: %zu\n", input_tokens.size());
@@ -149,15 +149,16 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
 }
 
 std::vector<int32_t> Qwen3ASR::build_input_tokens(int32_t n_audio_frames,
-                                                   const std::string & language) {
+                                                   const std::string & language,
+                                                   const std::string & system_prompt) {
     const auto & cfg = decoder_.get_config();
-    
+
     std::vector<int32_t> tokens;
-    tokens.reserve(n_audio_frames + 20);
-    
+    tokens.reserve(n_audio_frames + 20 + 64);
+
     // Chat template format:
-    // <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|>...<|audio_end|><|im_end|>\n<|im_start|>assistant\n
-    
+    // <|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|>...<|audio_end|><|im_end|>\n<|im_start|>assistant\n
+
     // Token IDs from Qwen3 tokenizer:
     // <|im_start|> = 151644
     // <|im_end|> = 151645
@@ -165,42 +166,50 @@ std::vector<int32_t> Qwen3ASR::build_input_tokens(int32_t n_audio_frames,
     // user = 872
     // assistant = 77091
     // \n = 198
-    
+
     const int32_t im_start = 151644;
     const int32_t im_end = 151645;
     const int32_t system_token = 8948;
     const int32_t user_token = 872;
     const int32_t assistant_token = 77091;
     const int32_t newline = 198;
-    
-    // <|im_start|>system\n<|im_end|>\n
+
+    // <|im_start|>system\n
     tokens.push_back(im_start);
     tokens.push_back(system_token);
     tokens.push_back(newline);
+
+    // Inject system prompt tokens if provided
+    if (!system_prompt.empty()) {
+        std::vector<int32_t> prompt_tokens = decoder_.tokenize(system_prompt);
+        tokens.insert(tokens.end(), prompt_tokens.begin(), prompt_tokens.end());
+    }
+
+    // <|im_end|>\n
     tokens.push_back(im_end);
     tokens.push_back(newline);
-    
+
     // <|im_start|>user\n
     tokens.push_back(im_start);
     tokens.push_back(user_token);
     tokens.push_back(newline);
-    
+
     // <|audio_start|><|audio_pad|>...<|audio_end|>
     tokens.push_back(cfg.audio_start_token_id);
     for (int32_t i = 0; i < n_audio_frames; ++i) {
         tokens.push_back(cfg.audio_pad_token_id);
     }
     tokens.push_back(cfg.audio_end_token_id);
-    
+
     // <|im_end|>\n<|im_start|>assistant\n
     tokens.push_back(im_end);
     tokens.push_back(newline);
     tokens.push_back(im_start);
     tokens.push_back(assistant_token);
     tokens.push_back(newline);
-    
+
     (void)language;
-    
+
     return tokens;
 }
 
@@ -219,9 +228,19 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
     
     std::vector<float> logits;
     
-    // Audio pad tokens start after: <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>
-    // That's 8 tokens before the first audio_pad
-    int32_t audio_start_pos = 9;
+    // Dynamically find the position of the first audio_pad token.
+    // This adapts to system prompts of any length.
+    int32_t audio_start_pos = -1;
+    for (size_t i = 0; i < input_tokens.size(); ++i) {
+        if (input_tokens[i] == cfg.audio_pad_token_id) {
+            audio_start_pos = static_cast<int32_t>(i);
+            break;
+        }
+    }
+    if (audio_start_pos < 0) {
+        error_msg_ = "No audio_pad token found in input sequence";
+        return false;
+    }
     
     {
         QWEN3_TIMER("decode.initial_forward");

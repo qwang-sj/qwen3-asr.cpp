@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <climits>
 #include <fstream>
+#include <sstream>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -800,20 +802,153 @@ bool TextDecoder::load_vocab(struct gguf_context * ctx) {
         error_msg_ = "Vocabulary not found in GGUF file";
         return false;
     }
-    
+
     int64_t n_vocab = gguf_get_arr_n(ctx, tokens_idx);
     if (n_vocab <= 0) {
         error_msg_ = "Empty vocabulary in GGUF file";
         return false;
     }
-    
+
     vocab_.resize(n_vocab);
     for (int64_t i = 0; i < n_vocab; ++i) {
         vocab_[i] = gguf_get_arr_str(ctx, tokens_idx, i);
     }
-    
+
+    // Build forward map: token string -> token ID
+    for (int64_t i = 0; i < n_vocab; ++i) {
+        token_to_id_[vocab_[i]] = static_cast<int32_t>(i);
+    }
+
+    // Load BPE merges
+    int64_t merges_idx = gguf_find_key(ctx, "tokenizer.ggml.merges");
+    if (merges_idx >= 0) {
+        int64_t n_merges = gguf_get_arr_n(ctx, merges_idx);
+        for (int64_t i = 0; i < n_merges; ++i) {
+            std::string merge = gguf_get_arr_str(ctx, merges_idx, i);
+            bpe_ranks_[merge] = static_cast<int>(i);
+        }
+    }
+
     return true;
 }
+
+// --- BPE encoding helpers (for tokenize()) ---
+
+// GPT-2 byte-to-unicode: maps each byte value to a Unicode codepoint string.
+static const std::vector<std::string> & get_byte_to_unicode_table() {
+    static std::vector<std::string> table;
+    if (!table.empty()) return table;
+    table.resize(256);
+
+    std::vector<int> byte_to_cp(256, 0);
+    std::vector<bool> assigned(256, false);
+
+    auto mark = [&](int lo, int hi) {
+        for (int b = lo; b <= hi; ++b) {
+            byte_to_cp[b] = b;
+            assigned[b] = true;
+        }
+    };
+    mark(0x21, 0x7E);
+    mark(0xA1, 0xAC);
+    mark(0xAE, 0xFF);
+
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        if (!assigned[b]) {
+            byte_to_cp[b] = 256 + n;
+            ++n;
+        }
+    }
+
+    auto cp_to_utf8 = [](int cp) -> std::string {
+        std::string s;
+        if (cp < 0x80) {
+            s += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            s += static_cast<char>(0xC0 | (cp >> 6));
+            s += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            s += static_cast<char>(0xE0 | (cp >> 12));
+            s += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            s += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        return s;
+    };
+
+    for (int b = 0; b < 256; ++b) {
+        table[b] = cp_to_utf8(byte_to_cp[b]);
+    }
+    return table;
+}
+
+static std::string bytes_to_bpe_string(const std::string & text) {
+    const auto & table = get_byte_to_unicode_table();
+    std::string result;
+    result.reserve(text.size() * 2);
+    for (unsigned char c : text) {
+        result += table[c];
+    }
+    return result;
+}
+
+static std::vector<std::string> split_utf8_chars(const std::string & s) {
+    std::vector<std::string> chars;
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        if (i + len > s.size()) len = 1;
+        chars.push_back(s.substr(i, len));
+        i += len;
+    }
+    return chars;
+}
+
+static std::vector<std::string> bpe_encode_word(
+    const std::string & word_bpe,
+    const std::unordered_map<std::string, int> & bpe_ranks) {
+
+    std::vector<std::string> symbols = split_utf8_chars(word_bpe);
+    if (symbols.size() <= 1) return symbols;
+
+    while (true) {
+        int best_rank = INT_MAX;
+        size_t best_pos = 0;
+
+        for (size_t i = 0; i + 1 < symbols.size(); ++i) {
+            std::string key = symbols[i] + " " + symbols[i + 1];
+            auto it = bpe_ranks.find(key);
+            if (it != bpe_ranks.end() && it->second < best_rank) {
+                best_rank = it->second;
+                best_pos = i;
+            }
+        }
+
+        if (best_rank == INT_MAX) break;
+
+        std::string merged = symbols[best_pos] + symbols[best_pos + 1];
+        std::vector<std::string> new_symbols;
+        new_symbols.reserve(symbols.size() - 1);
+        for (size_t i = 0; i < symbols.size(); ++i) {
+            if (i == best_pos) {
+                new_symbols.push_back(merged);
+                ++i;
+            } else {
+                new_symbols.push_back(symbols[i]);
+            }
+        }
+        symbols = std::move(new_symbols);
+        if (symbols.size() == 1) break;
+    }
+
+    return symbols;
+}
+
+// --- BPE decoding helpers (for decode_token()) ---
 
 // GPT-2 byte-level BPE: reverse mapping from Unicode codepoints back to raw bytes.
 // See HuggingFace tokenizers bytes_to_unicode() — printable bytes map to themselves,
@@ -937,6 +1072,34 @@ std::string TextDecoder::decode_tokens(const std::vector<int32_t> & tokens) cons
         result += decode_token(token);
     }
     return result;
+}
+
+std::vector<int32_t> TextDecoder::tokenize(const std::string & text) const {
+    std::vector<int32_t> token_ids;
+    if (text.empty()) return token_ids;
+
+    // Split text into whitespace-separated words
+    std::istringstream iss(text);
+    std::string word;
+    bool first = true;
+
+    while (iss >> word) {
+        // Prepend space to non-first words (GPT-2 BPE convention)
+        std::string to_encode = first ? word : (" " + word);
+        first = false;
+
+        std::string bpe_str = bytes_to_bpe_string(to_encode);
+        std::vector<std::string> subwords = bpe_encode_word(bpe_str, bpe_ranks_);
+
+        for (const auto & sw : subwords) {
+            auto it = token_to_id_.find(sw);
+            if (it != token_to_id_.end()) {
+                token_ids.push_back(it->second);
+            }
+        }
+    }
+
+    return token_ids;
 }
 
 } // namespace qwen3_asr

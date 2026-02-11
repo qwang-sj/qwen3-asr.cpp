@@ -15,16 +15,20 @@ namespace qwen3_asr {
 struct transcribe_params {
     // Maximum number of tokens to generate
     int32_t max_tokens = 1024;
-    
+
     // Language code (optional, for prompting)
     std::string language = "";
-    
+
+    // System prompt for context biasing (optional)
+    // Provide domain-specific terms to improve transcription accuracy.
+    std::string system_prompt = "";
+
     // Number of threads for mel computation
     int32_t n_threads = 4;
-    
+
     // Print progress during transcription
     bool print_progress = false;
-    
+
     // Print timing information
     bool print_timing = true;
 };
@@ -86,8 +90,9 @@ private:
                                            const transcribe_params & params);
     
     // Build input token sequence for audio
-    std::vector<int32_t> build_input_tokens(int32_t n_audio_frames, 
-                                             const std::string & language);
+    std::vector<int32_t> build_input_tokens(int32_t n_audio_frames,
+                                             const std::string & language,
+                                             const std::string & system_prompt);
     
     // Greedy decoding loop
     bool decode_greedy(const std::vector<int32_t> & input_tokens,
